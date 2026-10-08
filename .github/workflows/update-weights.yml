@@ -1,0 +1,60 @@
+name: Update weights
+
+on: # yamllint disable-line rule:truthy
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: update-weights
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+      TRACER_REPO: DataDog/dd-trace-rb
+    steps:
+      - name: Check out weights repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check out dd-trace-rb
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: DataDog/dd-trace-rb
+          ref: master
+          path: tracer
+
+      - name: Download timing artifacts
+        run: |
+          set -eu
+          mkdir -p timings
+          run_ids="$(gh run list --repo "$TRACER_REPO" --workflow "Unit Tests" --branch master --status success --limit 5 --json databaseId --jq '.[].databaseId')"
+          for run_id in $run_ids; do
+            names="$(gh api "repos/$TRACER_REPO/actions/runs/$run_id/artifacts" --jq '.artifacts[] | select(.name | startswith("timings-")) | .name')"
+            for name in $names; do
+              gh run download "$run_id" --repo "$TRACER_REPO" --name "$name" --dir "timings/$run_id"
+            done
+          done
+
+      - name: Aggregate timings
+        run: |
+          set -eu
+          rake -f tracer/tasks/github.rake "github:update_task_timings[$PWD/timings]"
+          cp tracer/tasks/ci_task_timings.json ci_task_timings.json
+
+      - name: Commit
+        run: |
+          set -eu
+          git diff --quiet -- ci_task_timings.json && exit 0
+          git config user.name "weights-bot"
+          git config user.email "weights-bot@users.noreply.github.com"
+          git add ci_task_timings.json
+          git commit -m "Update task timings"
+          git push
